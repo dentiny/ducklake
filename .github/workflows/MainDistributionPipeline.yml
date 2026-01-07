@@ -11,12 +11,15 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/main' || github.sha }}
   cancel-in-progress: true
 
+env:
+  DUCKDB_VERSION: ${{ github.base_ref || 'main' }}
+
 jobs:
   duckdb-next-build:
     name: Build extension binaries
     uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@main
     with:
-      duckdb_version: main
+      duckdb_version: ${{ env.DUCKDB_VERSION }}
       ci_tools_version: main
       extension_name: ducklake
 
@@ -27,7 +30,7 @@ jobs:
     secrets: inherit
     with:
       extension_name: ducklake
-      duckdb_version: main
+      duckdb_version: ${{ env.DUCKDB_VERSION }}
       ci_tools_version: main
       deploy_latest: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
       deploy_versioned: ${{ startsWith(github.ref, 'refs/heads/v') || github.ref == 'refs/heads/main' }}
