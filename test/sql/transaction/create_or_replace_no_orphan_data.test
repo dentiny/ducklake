@@ -1,0 +1,66 @@
+# name: test/sql/transaction/create_or_replace_no_orphan_data.test
+# description: Test that CREATE OR REPLACE TABLE in a transaction does not commit orphan inlined data for the dropped table
+# group: [transaction]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_cor_orphan', METADATA_CATALOG 'ducklake_meta')
+
+statement ok
+USE ducklake
+
+# snapshot 1: create the table
+statement ok
+CREATE TABLE t1 (i INTEGER);
+
+# snapshot 2: insert initial data
+statement ok
+INSERT INTO t1 VALUES (1), (2), (3);
+
+# snapshot 3: within a single transaction, insert into the old table, CREATE OR REPLACE it with a new schema and insert into the new table
+statement ok
+BEGIN
+
+statement ok
+INSERT INTO t1 VALUES (4)
+
+statement ok
+CREATE OR REPLACE TABLE t1 (i INTEGER, j VARCHAR)
+
+statement ok
+INSERT INTO t1 VALUES (10, 'new')
+
+statement ok
+COMMIT
+
+# Only the new table's data is visible
+query II
+SELECT * FROM t1
+----
+10	new
+
+# The dropped table should not have any inlined data committed,
+# there should be no inlined data entries referencing such a table
+query I
+SELECT COUNT(*)
+FROM ducklake_meta.ducklake_inlined_data_tables idt
+JOIN ducklake_meta.ducklake_table t USING (table_id)
+WHERE t.end_snapshot IS NOT NULL
+----
+0
+
+# The snapshot changes for the final commit do not contain an inlined_insert referencing the dropped table id
+query I
+SELECT COUNT(*)
+FROM ducklake_meta.ducklake_snapshot_changes sc
+JOIN ducklake_meta.ducklake_table t ON t.end_snapshot IS NOT NULL
+WHERE sc.changes_made LIKE '%inlined_insert:' || t.table_id || '%'
+----
+0
