@@ -2,6 +2,7 @@
 #include "storage/ducklake_stats.hpp"
 
 #include "duckdb/common/type_visitor.hpp"
+#include "duckdb/common/vector_operations/vector_operations.hpp"
 #include "storage/ducklake_insert.hpp"
 #include "storage/ducklake_table_entry.hpp"
 #include "storage/ducklake_transaction.hpp"
@@ -74,12 +75,21 @@ unique_ptr<GlobalOperatorState> DuckLakeInlineData::GetGlobalOperatorState(Clien
 	return make_uniq<InlineDataGlobalState>(*this);
 }
 
+void DuckLakeInlineData::VerifyNestedNotNull(DataChunk &chunk) const {
+	for (auto &entry : not_null_nested_columns) {
+		if (VectorOperations::HasNull(chunk.data[entry.first], chunk.size())) {
+			throw ConstraintException("NOT NULL constraint failed: %s.%s", table_name, entry.second);
+		}
+	}
+}
+
 OperatorResultType DuckLakeInlineData::Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
                                                GlobalOperatorState &gstate_p, OperatorState &state_p) const {
 	auto &state = state_p.Cast<InlineDataState>();
 	auto &gstate = gstate_p.Cast<InlineDataGlobalState>();
 	if (state.phase == InlinePhase::PASS_THROUGH_ROWS) {
 		// not inlining rows - forward the input directly
+		VerifyNestedNotNull(input);
 		chunk.Reference(input);
 		return OperatorResultType::NEED_MORE_INPUT;
 	}
@@ -90,6 +100,8 @@ OperatorResultType DuckLakeInlineData::Execute(ExecutionContext &context, DataCh
 			// finished emitting previously inlined rows - destroy them and pass through any subsequent rows
 			state.inlined_data.reset();
 			state.phase = InlinePhase::PASS_THROUGH_ROWS;
+		} else {
+			VerifyNestedNotNull(chunk);
 		}
 		return OperatorResultType::HAVE_MORE_OUTPUT;
 	}
@@ -125,6 +137,7 @@ OperatorFinalizeResultType DuckLakeInlineData::FinalExecute(ExecutionContext &co
 		// emitting previously inlined rows
 		state.inlined_data->Scan(state.emit_scan, chunk);
 		if (chunk.size() != 0) {
+			VerifyNestedNotNull(chunk);
 			return OperatorFinalizeResultType::HAVE_MORE_OUTPUT;
 		}
 		// finished emitting previously inlined rows - we're done
@@ -245,7 +258,27 @@ void UpdateStats(vector<DuckLakeBaseColumnStats> &stats, idx_t c, Vector &data, 
 	auto &column_stats = stats[c];
 	auto &type = data.GetType();
 	if (type.IsNested() && type.id() != LogicalTypeId::VARIANT) {
-		// nested - recurse into children
+		// compute null count for the nested column itself
+		UnifiedVectorFormat format;
+		data.ToUnifiedFormat(row_count, format);
+		DuckLakeColumnStats nested_stats(type);
+		nested_stats.has_null_count = true;
+		nested_stats.any_valid = false;
+		for (idx_t i = 0; i < row_count; i++) {
+			auto idx = format.sel->get_index(i);
+			if (!format.validity.RowIsValid(idx)) {
+				nested_stats.null_count++;
+			} else {
+				nested_stats.any_valid = true;
+			}
+		}
+		if (column_stats.has_stats) {
+			column_stats.stats.MergeStats(nested_stats);
+		} else {
+			column_stats.stats = std::move(nested_stats);
+			column_stats.has_stats = true;
+		}
+		// recurse into children
 		switch (data.GetType().id()) {
 		case LogicalTypeId::STRUCT: {
 			auto &children = StructVector::GetEntries(data);

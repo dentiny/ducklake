@@ -1,0 +1,71 @@
+# name: test/sql/constraints/not_null_nested_types_file_path.test
+# description: test NOT NULL constraint on nested types via file-based insert
+# group: [constraints]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION __TEST_DIR__/{UUID}.db
+
+test-env DATA_PATH __TEST_DIR__
+
+statement ok
+ATTACH 'ducklake:${DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '${DATA_PATH}/ducklake_not_null_nested_file_path', DATA_INLINING_ROW_LIMIT 0)
+
+# -----------------------------------------------
+# STRUCT column with NOT NULL (file path)
+# -----------------------------------------------
+statement ok
+CREATE TABLE ducklake.struct_tbl(id INTEGER, s STRUCT(a INTEGER, b INTEGER) NOT NULL);
+
+statement ok
+INSERT INTO ducklake.struct_tbl VALUES (1, ROW(10, 20));
+
+statement error
+INSERT INTO ducklake.struct_tbl VALUES (2, NULL);
+----
+NOT NULL constraint failed
+
+query II
+SELECT * FROM ducklake.struct_tbl
+----
+1	{'a': 10, 'b': 20}
+
+# -----------------------------------------------
+# LIST column with NOT NULL (file path)
+# -----------------------------------------------
+statement ok
+CREATE TABLE ducklake.list_tbl(id INTEGER, l INTEGER[] NOT NULL);
+
+statement ok
+INSERT INTO ducklake.list_tbl VALUES (1, [10, 20]);
+
+statement error
+INSERT INTO ducklake.list_tbl VALUES (2, NULL);
+----
+NOT NULL constraint failed
+
+query II
+SELECT * FROM ducklake.list_tbl ORDER BY id
+----
+1	[10, 20]
+
+# -----------------------------------------------
+# MAP column with NOT NULL (file path)
+# -----------------------------------------------
+statement ok
+CREATE TABLE ducklake.map_tbl(id INTEGER, m MAP(VARCHAR, INTEGER) NOT NULL);
+
+statement ok
+INSERT INTO ducklake.map_tbl VALUES (1, MAP {'key': 42});
+
+statement error
+INSERT INTO ducklake.map_tbl VALUES (2, NULL);
+----
+NOT NULL constraint failed
+
+query II
+SELECT * FROM ducklake.map_tbl ORDER BY id
+----
+1	{key=42}

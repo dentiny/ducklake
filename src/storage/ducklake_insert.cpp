@@ -782,6 +782,17 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 	}
 	auto &ducklake_table = op.table.Cast<DuckLakeTableEntry>();
 
+	// Determine NOT NULL constraints on nested columns for validation
+	vector<pair<idx_t, string>> not_null_nested_columns;
+	auto not_null_fields = ducklake_table.GetNotNullFields();
+	auto &columns = ducklake_table.GetColumns();
+	for (idx_t i = 0; i < columns.PhysicalColumnCount(); i++) {
+		auto &col = columns.GetColumn(PhysicalIndex(i));
+		if (col.GetType().IsNested() && not_null_fields.count(col.GetName())) {
+			not_null_nested_columns.emplace_back(i, col.GetName());
+		}
+	}
+
 	// Sort data according to the table's SET SORTED BY configuration
 	auto sort_data = ducklake_table.GetSortData();
 	auto &ducklake_schema_for_sort = ducklake_table.ParentSchema().Cast<DuckLakeSchemaEntry>();
@@ -811,7 +822,17 @@ PhysicalOperator &DuckLakeCatalog::PlanInsert(ClientContext &context, PhysicalPl
 				plan = sorted_plan;
 			}
 		}
+	} else if (!not_null_nested_columns.empty()) {
+		// Inlining disabled but we need InlineData for NOT NULL validation on nested columns
+		plan = planner.Make<DuckLakeInlineData>(*plan, idx_t(0));
+		inline_data = plan->Cast<DuckLakeInlineData>();
 	}
+
+	if (inline_data && !not_null_nested_columns.empty()) {
+		inline_data->not_null_nested_columns = std::move(not_null_nested_columns);
+		inline_data->table_name = ducklake_table.name;
+	}
+
 	DuckLakeCopyInput copy_input(context, ducklake_table);
 	auto &physical_copy = DuckLakeInsert::PlanCopyForInsert(context, planner, copy_input, plan);
 	auto &insert = DuckLakeInsert::PlanInsert(context, planner, ducklake_table, std::move(copy_input.encryption_key));

@@ -25,10 +25,15 @@ public:
 
 	idx_t inline_row_limit;
 	optional_ptr<DuckLakeInsert> insert;
+	//! NOT NULL nested columns: (physical column index, column name) pairs
+	vector<pair<idx_t, string>> not_null_nested_columns;
+	//! Table name for error messages
+	string table_name;
 
 public:
 	unique_ptr<OperatorState> GetOperatorState(ExecutionContext &context) const override;
 	unique_ptr<GlobalOperatorState> GetGlobalOperatorState(ClientContext &context) const override;
+	void VerifyNestedNotNull(DataChunk &chunk) const;
 	OperatorResultType Execute(ExecutionContext &context, DataChunk &input, DataChunk &chunk,
 	                           GlobalOperatorState &gstate, OperatorState &state) const override;
 	OperatorFinalizeResultType FinalExecute(ExecutionContext &context, DataChunk &chunk, GlobalOperatorState &gstate,
