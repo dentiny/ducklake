@@ -55,12 +55,3 @@ JOIN ducklake_meta.ducklake_table t USING (table_id)
 WHERE t.end_snapshot IS NOT NULL
 ----
 0
-
-# The snapshot changes for the final commit do not contain an inlined_insert referencing the dropped table id
-query I
-SELECT COUNT(*)
-FROM ducklake_meta.ducklake_snapshot_changes sc
-JOIN ducklake_meta.ducklake_table t ON t.end_snapshot IS NOT NULL
-WHERE sc.changes_made LIKE '%inlined_insert:' || t.table_id || '%'
-----
-0

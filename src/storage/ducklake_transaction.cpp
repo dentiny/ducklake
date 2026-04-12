@@ -2914,6 +2914,8 @@ void DuckLakeTransaction::DropTable(DuckLakeTableEntry &table) {
 	} else {
 		auto table_id = table.GetTableId();
 		dropped_tables.insert(table_id);
+		auto context_ref = context.lock();
+		local_changes.CleanupFiles(*context_ref, table_id);
 	}
 }
 

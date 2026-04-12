@@ -296,6 +296,8 @@ private:
 	template <class T>
 	string FlushDrop(const string &metadata_table_name, const string &id_name, const set<T> &dropped_entries);
 	template <class T>
+	string FlushDelete(const string &metadata_table_name, const string &id_name, const set<T> &ids);
+	template <class T>
 	DuckLakeFileData ReadDataFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx, bool is_encrypted);
 	template <class T>
 	DuckLakeFileData ReadDeleteFile(DuckLakeTableEntry &table, T &row, idx_t &col_idx, bool is_encrypted);

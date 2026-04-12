@@ -1956,6 +1956,16 @@ string DuckLakeMetadataManager::FlushDrop(const string &metadata_table_name, con
 	    metadata_table_name, id_name, dropped_id_list);
 }
 
+template <class T>
+string DuckLakeMetadataManager::FlushDelete(const string &metadata_table_name, const string &id_name,
+                                            const set<T> &ids) {
+	if (ids.empty()) {
+		return {};
+	}
+	return StringUtil::Format(R"(DELETE FROM {METADATA_CATALOG}.%s WHERE %s IN (%s);)", metadata_table_name, id_name,
+	                          GenerateIDList(ids));
+}
+
 string DuckLakeMetadataManager::DropSchemas(const set<SchemaIndex> &ids) {
 	return FlushDrop("ducklake_schema", "schema_id", ids);
 }
@@ -1970,6 +1980,7 @@ string DuckLakeMetadataManager::DropTables(const set<TableIndex> &ids, bool rena
 		batch_query += FlushDrop("ducklake_delete_file", "table_id", ids);
 		batch_query += FlushDrop("ducklake_tag", "object_id", ids);
 		batch_query += FlushDrop("ducklake_sort_info", "table_id", ids);
+		batch_query += FlushDelete("ducklake_inlined_data_tables", "table_id", ids);
 	}
 	return batch_query;
 }
