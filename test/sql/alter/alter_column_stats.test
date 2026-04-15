@@ -1,0 +1,94 @@
+# name: test/sql/alter/alter_column_stats.test
+# description: Test that ALTER TABLE ADD/DROP COLUMN correctly updates ducklake_table_column_stats
+# group: [alter]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (DATA_PATH '{TEST_DIR}/alter_column_stats')
+
+statement ok
+USE ducklake
+
+statement ok
+CREATE TABLE test_table (col1 INTEGER, col2 INTEGER);
+
+statement ok
+INSERT INTO test_table VALUES (1, 10), (2, 20), (3, 30);
+
+# Both columns must be tracked in table_column_stats after first insert
+query I
+SELECT COUNT(*) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+2
+
+# ADD COLUMN: new column must appear in table_column_stats after first insert that uses it
+
+statement ok
+ALTER TABLE test_table ADD COLUMN col3 INTEGER;
+
+statement ok
+INSERT INTO test_table VALUES (4, 40, 400), (5, 50, 500);
+
+query I
+SELECT COUNT(*) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+3
+
+query I
+SELECT COUNT(DISTINCT column_id) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+3
+
+# DROP COLUMN: the dropped column's stats must be removed from table_column_stats immediately
+
+statement ok
+ALTER TABLE test_table DROP COLUMN col3;
+
+query I
+SELECT COUNT(*) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+2
+
+# After a subsequent INSERT the dropped column's stats must not reappear
+
+statement ok
+INSERT INTO test_table VALUES (6, 60), (7, 70);
+
+query I
+SELECT COUNT(*) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+2
+
+# Drop a second column to verify the remaining column is still tracked
+
+statement ok
+ALTER TABLE test_table DROP COLUMN col2;
+
+query I
+SELECT COUNT(*) FROM __ducklake_metadata_ducklake.ducklake_table_column_stats
+WHERE table_id = (SELECT table_id FROM __ducklake_metadata_ducklake.ducklake_table WHERE table_name = 'test_table')
+----
+1
+
+# Final sanity check: data is intact for the surviving column
+
+query I
+FROM test_table ORDER BY col1
+----
+1
+2
+3
+4
+5
+6
+7

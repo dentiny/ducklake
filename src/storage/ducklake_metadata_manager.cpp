@@ -2260,7 +2260,7 @@ string DuckLakeMetadataManager::WriteDroppedColumns(const vector<DuckLakeDropped
 		}
 		dropped_cols += StringUtil::Format("(%d, %d)", dropped_col.table_id.index, dropped_col.field_id.index);
 	}
-	// overwrite the snapshot for the old columns
+	// overwrite the snapshot for the old columns and remove their global stats
 	return StringUtil::Format(R"(
 WITH dropped_cols(tid, cid) AS (
 VALUES %s
@@ -2268,9 +2268,12 @@ VALUES %s
 UPDATE {METADATA_CATALOG}.ducklake_column
 SET end_snapshot = {SNAPSHOT_ID}
 FROM dropped_cols
-WHERE table_id=tid AND column_id=cid AND end_snapshot IS NULL
-;)",
-	                          dropped_cols);
+WHERE table_id=tid AND column_id=cid AND end_snapshot IS NULL;
+
+DELETE FROM {METADATA_CATALOG}.ducklake_table_column_stats
+WHERE (table_id, column_id) IN (VALUES %s);
+)",
+	                          dropped_cols, dropped_cols);
 }
 
 string DuckLakeMetadataManager::WriteNewColumns(const vector<DuckLakeNewColumn> &new_columns) {
@@ -3880,37 +3883,36 @@ struct ColumnStatsSQL {
 string DuckLakeMetadataManager::UpdateGlobalTableStats(const DuckLakeGlobalStatsInfo &stats) {
 	string batch_query;
 
+	// Build column stats values
+	string column_stats_values;
+	for (auto &col_stats : stats.column_stats) {
+		if (!column_stats_values.empty()) {
+			column_stats_values += ",";
+		}
+		auto sql = ColumnStatsSQL::FromColumnStats(col_stats);
+		column_stats_values +=
+		    StringUtil::Format("(%d, %d, %s, %s, %s, %s, %s)", stats.table_id.index, col_stats.column_id.index,
+		                       sql.contains_null, sql.contains_nan, sql.min_val, sql.max_val, sql.extra_stats);
+	}
+
 	if (!stats.initialized) {
 		batch_query +=
 		    StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_stats VALUES (%d, %d, %d, %d);",
 		                       stats.table_id.index, stats.record_count, stats.next_row_id, stats.table_size_bytes);
-		string column_stats_values;
-		for (auto &col_stats : stats.column_stats) {
-			if (!column_stats_values.empty()) {
-				column_stats_values += ",";
-			}
-			auto sql = ColumnStatsSQL::FromColumnStats(col_stats);
-			column_stats_values +=
-			    StringUtil::Format("(%d, %d, %s, %s, %s, %s, %s)", stats.table_id.index, col_stats.column_id.index,
-			                       sql.contains_null, sql.contains_nan, sql.min_val, sql.max_val, sql.extra_stats);
-		}
-		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_column_stats VALUES %s;",
-		                                  column_stats_values);
 	} else {
-		// stats have been initialized - update them
 		batch_query += StringUtil::Format(
 		    "UPDATE {METADATA_CATALOG}.ducklake_table_stats SET record_count=%d, file_size_bytes=%d, "
 		    "next_row_id=%d WHERE table_id=%d;",
 		    stats.record_count, stats.table_size_bytes, stats.next_row_id, stats.table_id.index);
-		for (auto &col_stats : stats.column_stats) {
-			auto sql = ColumnStatsSQL::FromColumnStats(col_stats);
-			batch_query +=
-			    StringUtil::Format("UPDATE {METADATA_CATALOG}.ducklake_table_column_stats "
-			                       "SET contains_null=%s, contains_nan=%s, min_value=%s, max_value=%s, extra_stats=%s "
-			                       "WHERE table_id=%d AND column_id=%d;",
-			                       sql.contains_null, sql.contains_nan, sql.min_val, sql.max_val, sql.extra_stats,
-			                       stats.table_id.index, col_stats.column_id.index);
-		}
+		// Delete all existing column stats for this table and re-insert them all.
+		// This naturally handles new columns added via ALTER TABLE ADD COLUMN.
+		batch_query += StringUtil::Format(
+		    "DELETE FROM {METADATA_CATALOG}.ducklake_table_column_stats WHERE table_id=%d;",
+		    stats.table_id.index);
+	}
+	if (!column_stats_values.empty()) {
+		batch_query += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.ducklake_table_column_stats VALUES %s;",
+		                                  column_stats_values);
 	}
 	return batch_query;
 }
