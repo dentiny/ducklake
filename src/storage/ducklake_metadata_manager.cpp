@@ -450,6 +450,368 @@ vector<DuckLakeMacroImplementation> DuckLakeMetadataManager::LoadMacroImplementa
 	return result;
 }
 
+static string OptionalSnapshotFilter(const string &prefix) {
+	return StringUtil::Format("{SNAPSHOT_ID} >= %s.begin_snapshot AND "
+	                          "({SNAPSHOT_ID} < %s.end_snapshot OR %s.end_snapshot IS NULL)",
+	                          prefix, prefix, prefix);
+}
+
+vector<DuckLakeSchemaInfo> DuckLakeMetadataManager::GetSchemasForSnapshot(DuckLakeSnapshot snapshot,
+                                                                          optional_idx schema_id,
+                                                                          const string &schema_name) {
+	auto &ducklake_catalog = transaction.GetCatalog();
+	auto &base_data_path = ducklake_catalog.DataPath();
+	string filter;
+	if (schema_id.IsValid()) {
+		filter += StringUtil::Format(" AND schema_id = %llu", schema_id.GetIndex());
+	}
+	if (!schema_name.empty()) {
+		filter += StringUtil::Format(" AND schema_name = %s", SQLString(schema_name));
+	}
+
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT schema_id, schema_uuid::VARCHAR, schema_name, path, path_is_relative
+FROM {METADATA_CATALOG}.ducklake_schema
+WHERE %s%s
+ORDER BY schema_id
+)",
+	                                                            OptionalSnapshotFilter("ducklake_schema"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get schema information from DuckLake: ");
+	}
+
+	vector<DuckLakeSchemaInfo> schemas;
+	for (auto &row : *result) {
+		DuckLakeSchemaInfo schema;
+		schema.id = SchemaIndex(row.GetValue<uint64_t>(0));
+		schema.uuid = row.GetValue<string>(1);
+		schema.name = row.GetValue<string>(2);
+		if (row.IsNull(3)) {
+			schema.path = base_data_path;
+		} else {
+			DuckLakePath path;
+			path.path = row.GetValue<string>(3);
+			path.path_is_relative = row.GetValue<bool>(4);
+			schema.path = FromRelativePath(path);
+		}
+		schemas.push_back(std::move(schema));
+	}
+	return schemas;
+}
+
+vector<DuckLakeTableInfo> DuckLakeMetadataManager::GetTablesForSnapshot(DuckLakeSnapshot snapshot,
+                                                                        optional_idx schema_id, optional_idx table_id,
+                                                                        const string &table_name) {
+	static const vector<pair<string, string>> TAG_FIELDS = {{"key", "key"}, {"value", "value"}};
+	static const vector<pair<string, string>> INLINED_DATA_TABLES_FIELDS = {{"name", "table_name"},
+	                                                                        {"schema_version", "schema_version"}};
+	auto &ducklake_catalog = transaction.GetCatalog();
+	auto &base_data_path = ducklake_catalog.DataPath();
+	string filter;
+	if (schema_id.IsValid()) {
+		filter += StringUtil::Format(" AND tbl.schema_id = %llu", schema_id.GetIndex());
+	}
+	if (table_id.IsValid()) {
+		filter += StringUtil::Format(" AND tbl.table_id = %llu", table_id.GetIndex());
+	}
+	if (!table_name.empty()) {
+		filter += StringUtil::Format(" AND tbl.table_name = %s", SQLString(table_name));
+	}
+
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT tbl.schema_id, tbl.table_id, table_uuid::VARCHAR, table_name,
+	(
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_tag tag
+		WHERE object_id=tbl.table_id AND
+		      {SNAPSHOT_ID} >= tag.begin_snapshot AND ({SNAPSHOT_ID} < tag.end_snapshot OR tag.end_snapshot IS NULL)
+	) AS tag,
+	(
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_inlined_data_tables inlined_data_tables
+		WHERE inlined_data_tables.table_id = tbl.table_id
+	) AS inlined_data_tables,
+	s.path AS schema_path, s.path_is_relative AS schema_path_is_relative,
+	tbl.path AS table_path, tbl.path_is_relative AS table_path_is_relative,
+	col.column_id, column_name, column_type, initial_default, default_value, nulls_allowed, parent_column,
+	(
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_column_tag col_tag
+		WHERE col_tag.table_id=tbl.table_id AND col_tag.column_id=col.column_id AND
+		      {SNAPSHOT_ID} >= col_tag.begin_snapshot AND ({SNAPSHOT_ID} < col_tag.end_snapshot OR col_tag.end_snapshot IS NULL)
+	) AS column_tags, default_value_type
+FROM {METADATA_CATALOG}.ducklake_table tbl
+JOIN {METADATA_CATALOG}.ducklake_schema s USING (schema_id)
+LEFT JOIN {METADATA_CATALOG}.ducklake_column col USING (table_id)
+WHERE %s AND %s
+  AND (({SNAPSHOT_ID} >= col.begin_snapshot AND ({SNAPSHOT_ID} < col.end_snapshot OR col.end_snapshot IS NULL)) OR column_id IS NULL)
+  %s
+ORDER BY tbl.table_id, parent_column NULLS FIRST, column_order
+)",
+	                                                            ListAggregation(TAG_FIELDS),
+	                                                            ListAggregation(INLINED_DATA_TABLES_FIELDS),
+	                                                            ListAggregation(TAG_FIELDS),
+	                                                            OptionalSnapshotFilter("tbl"),
+	                                                            OptionalSnapshotFilter("s"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get table information from DuckLake: ");
+	}
+
+	const idx_t COLUMN_INDEX_START = 10;
+	vector<DuckLakeTableInfo> tables;
+	for (auto &row : *result) {
+		auto current_table_id = TableIndex(row.GetValue<uint64_t>(1));
+		if (tables.empty() || tables.back().id != current_table_id) {
+			DuckLakeTableInfo table_info;
+			table_info.schema_id = SchemaIndex(row.GetValue<uint64_t>(0));
+			table_info.id = current_table_id;
+			table_info.uuid = row.GetValue<string>(2);
+			table_info.name = row.GetValue<string>(3);
+			if (!row.IsNull(4)) {
+				table_info.tags = LoadTags(row.GetValue<Value>(4));
+			}
+			if (!row.IsNull(5)) {
+				table_info.inlined_data_tables = LoadInlinedDataTables(row.GetValue<Value>(5));
+			}
+			string schema_path = base_data_path;
+			if (!row.IsNull(6)) {
+				DuckLakePath path;
+				path.path = row.GetValue<string>(6);
+				path.path_is_relative = row.GetValue<bool>(7);
+				schema_path = FromRelativePath(path);
+			}
+			if (row.IsNull(8)) {
+				table_info.path = schema_path;
+			} else {
+				DuckLakePath path;
+				path.path = row.GetValue<string>(8);
+				path.path_is_relative = row.GetValue<bool>(9);
+				table_info.path = FromRelativePath(path, schema_path);
+			}
+			tables.push_back(std::move(table_info));
+		}
+
+		auto &table_entry = tables.back();
+		if (row.GetValue<Value>(COLUMN_INDEX_START).IsNull()) {
+			throw InvalidInputException("Failed to load DuckLake - Table entry \"%s\" does not have any columns",
+			                            table_entry.name);
+		}
+		DuckLakeColumnInfo column_info;
+		column_info.id = FieldIndex(row.GetValue<uint64_t>(COLUMN_INDEX_START));
+		column_info.name = row.GetValue<string>(COLUMN_INDEX_START + 1);
+		column_info.type = row.GetValue<string>(COLUMN_INDEX_START + 2);
+		if (!row.IsNull(COLUMN_INDEX_START + 3)) {
+			column_info.initial_default = Value(row.GetValue<string>(COLUMN_INDEX_START + 3));
+		}
+		if (!row.IsNull(COLUMN_INDEX_START + 4)) {
+			auto value = row.GetValue<string>(COLUMN_INDEX_START + 4);
+			column_info.default_value = value == "NULL" ? Value() : Value(value);
+		}
+		column_info.nulls_allowed = row.GetValue<bool>(COLUMN_INDEX_START + 5);
+		if (!row.IsNull(COLUMN_INDEX_START + 7)) {
+			column_info.tags = LoadTags(row.GetValue<Value>(COLUMN_INDEX_START + 7));
+		}
+		if (!row.IsNull(COLUMN_INDEX_START + 8)) {
+			column_info.default_value_type = row.GetValue<string>(COLUMN_INDEX_START + 8);
+		}
+		if (row.IsNull(COLUMN_INDEX_START + 6)) {
+			table_entry.columns.push_back(std::move(column_info));
+		} else {
+			auto parent_id = FieldIndex(row.GetValue<idx_t>(COLUMN_INDEX_START + 6));
+			if (!AddChildColumn(table_entry.columns, parent_id, column_info)) {
+				throw InvalidInputException("Failed to load DuckLake - Could not find parent column for column %s",
+				                            column_info.name);
+			}
+		}
+	}
+	return tables;
+}
+
+vector<DuckLakeViewInfo> DuckLakeMetadataManager::GetViewsForSnapshot(DuckLakeSnapshot snapshot,
+                                                                      optional_idx schema_id, optional_idx view_id,
+                                                                      const string &view_name) {
+	static const vector<pair<string, string>> TAG_FIELDS = {{"key", "key"}, {"value", "value"}};
+	string filter;
+	if (schema_id.IsValid()) {
+		filter += StringUtil::Format(" AND view.schema_id = %llu", schema_id.GetIndex());
+	}
+	if (view_id.IsValid()) {
+		filter += StringUtil::Format(" AND view.view_id = %llu", view_id.GetIndex());
+	}
+	if (!view_name.empty()) {
+		filter += StringUtil::Format(" AND view.view_name = %s", SQLString(view_name));
+	}
+
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT view_id, view_uuid, schema_id, view_name, dialect, sql, column_aliases,
+	(
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_tag tag
+		WHERE object_id=view_id AND
+		      {SNAPSHOT_ID} >= tag.begin_snapshot AND ({SNAPSHOT_ID} < tag.end_snapshot OR tag.end_snapshot IS NULL)
+	) AS tag
+FROM {METADATA_CATALOG}.ducklake_view view
+WHERE %s%s
+ORDER BY view_id
+)",
+	                                                            ListAggregation(TAG_FIELDS),
+	                                                            OptionalSnapshotFilter("view"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get view information from DuckLake: ");
+	}
+
+	vector<DuckLakeViewInfo> views;
+	for (auto &row : *result) {
+		DuckLakeViewInfo view_info;
+		view_info.id = TableIndex(row.GetValue<uint64_t>(0));
+		view_info.uuid = row.GetValue<string>(1);
+		view_info.schema_id = SchemaIndex(row.GetValue<uint64_t>(2));
+		view_info.name = row.GetValue<string>(3);
+		view_info.dialect = row.GetValue<string>(4);
+		view_info.sql = row.GetValue<string>(5);
+		view_info.column_aliases = DuckLakeUtil::ParseQuotedList(row.GetValue<string>(6));
+		if (!row.IsNull(7)) {
+			view_info.tags = LoadTags(row.GetValue<Value>(7));
+		}
+		views.push_back(std::move(view_info));
+	}
+	return views;
+}
+
+vector<DuckLakeMacroInfo> DuckLakeMetadataManager::GetMacrosForSnapshot(DuckLakeSnapshot snapshot,
+                                                                        optional_idx schema_id, optional_idx macro_id,
+                                                                        const string &macro_name) {
+	static const vector<pair<string, string>> MACRO_PARAM_FIELDS = {{"parameter_name", "parameter_name"},
+	                                                                {"parameter_type", "parameter_type"},
+	                                                                {"default_value", "default_value"},
+	                                                                {"default_value_type", "default_value_type"}};
+	auto macro_param_query = StringUtil::Format(R"(
+		(
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_macro_parameters
+		WHERE ducklake_macro_impl.macro_id = ducklake_macro_parameters.macro_id
+		AND ducklake_macro_impl.impl_id = ducklake_macro_parameters.impl_id
+		)
+	)",
+	                                            ListAggregation(MACRO_PARAM_FIELDS));
+	const vector<pair<string, string>> MACRO_IMPL_FIELDS = {
+	    {"dialect", "dialect"}, {"sql", "sql"}, {"type", "type"}, {"params", macro_param_query}};
+
+	string filter;
+	if (schema_id.IsValid()) {
+		filter += StringUtil::Format(" AND ducklake_macro.schema_id = %llu", schema_id.GetIndex());
+	}
+	if (macro_id.IsValid()) {
+		filter += StringUtil::Format(" AND ducklake_macro.macro_id = %llu", macro_id.GetIndex());
+	}
+	if (!macro_name.empty()) {
+		filter += StringUtil::Format(" AND ducklake_macro.macro_name = %s", SQLString(macro_name));
+	}
+
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT schema_id, ducklake_macro.macro_id, macro_name, (
+		SELECT %s
+		FROM {METADATA_CATALOG}.ducklake_macro_impl
+		WHERE ducklake_macro.macro_id = ducklake_macro_impl.macro_id
+	) AS impl
+FROM {METADATA_CATALOG}.ducklake_macro
+WHERE %s%s
+ORDER BY ducklake_macro.macro_id
+)",
+	                                                            ListAggregation(MACRO_IMPL_FIELDS),
+	                                                            OptionalSnapshotFilter("ducklake_macro"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get macro information from DuckLake: ");
+	}
+
+	vector<DuckLakeMacroInfo> macros;
+	for (auto &row : *result) {
+		DuckLakeMacroInfo macro_info;
+		macro_info.schema_id = SchemaIndex(row.GetValue<uint64_t>(0));
+		macro_info.macro_id = MacroIndex(row.GetValue<uint64_t>(1));
+		macro_info.macro_name = row.GetValue<string>(2);
+		macro_info.implementations = LoadMacroImplementations(row.GetValue<Value>(3));
+		macros.push_back(std::move(macro_info));
+	}
+	return macros;
+}
+
+vector<DuckLakePartitionInfo> DuckLakeMetadataManager::GetPartitionsForSnapshot(DuckLakeSnapshot snapshot,
+                                                                                optional_idx table_id) {
+	string filter;
+	if (table_id.IsValid()) {
+		filter = StringUtil::Format(" AND part.table_id = %llu", table_id.GetIndex());
+	}
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT partition_id, part.table_id, partition_key_index, column_id, transform
+FROM {METADATA_CATALOG}.ducklake_partition_info part
+JOIN {METADATA_CATALOG}.ducklake_partition_column part_col USING (partition_id)
+WHERE %s%s
+ORDER BY part.table_id, partition_id, partition_key_index
+)",
+	                                                            OptionalSnapshotFilter("part"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get partition information from DuckLake: ");
+	}
+
+	vector<DuckLakePartitionInfo> partitions;
+	for (auto &row : *result) {
+		auto current_table_id = TableIndex(row.GetValue<uint64_t>(1));
+		if (partitions.empty() || partitions.back().table_id != current_table_id) {
+			DuckLakePartitionInfo partition_info;
+			partition_info.id = row.GetValue<uint64_t>(0);
+			partition_info.table_id = current_table_id;
+			partitions.push_back(std::move(partition_info));
+		}
+		DuckLakePartitionFieldInfo partition_field;
+		partition_field.partition_key_index = row.GetValue<uint64_t>(2);
+		partition_field.field_id = FieldIndex(row.GetValue<uint64_t>(3));
+		partition_field.transform = row.GetValue<string>(4);
+		partitions.back().fields.push_back(std::move(partition_field));
+	}
+	return partitions;
+}
+
+vector<DuckLakeSortInfo> DuckLakeMetadataManager::GetSortsForSnapshot(DuckLakeSnapshot snapshot, optional_idx table_id) {
+	string filter;
+	if (table_id.IsValid()) {
+		filter = StringUtil::Format(" AND sort.table_id = %llu", table_id.GetIndex());
+	}
+	auto result = transaction.Query(snapshot, StringUtil::Format(R"(
+SELECT sort.sort_id, sort.table_id, sort_expr.sort_key_index, sort_expr.expression, sort_expr.dialect, sort_expr.sort_direction, sort_expr.null_order
+FROM {METADATA_CATALOG}.ducklake_sort_info sort
+JOIN {METADATA_CATALOG}.ducklake_sort_expression sort_expr USING (sort_id)
+WHERE %s%s
+ORDER BY sort.table_id, sort.sort_id, sort_expr.sort_key_index
+)",
+	                                                            OptionalSnapshotFilter("sort"), filter));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to get sort information from DuckLake: ");
+	}
+
+	vector<DuckLakeSortInfo> sorts;
+	for (auto &row : *result) {
+		auto current_table_id = TableIndex(row.GetValue<uint64_t>(1));
+		if (sorts.empty() || sorts.back().table_id != current_table_id) {
+			DuckLakeSortInfo sort_info;
+			sort_info.id = row.GetValue<uint64_t>(0);
+			sort_info.table_id = current_table_id;
+			sorts.push_back(std::move(sort_info));
+		}
+		DuckLakeSortFieldInfo sort_field;
+		sort_field.sort_key_index = row.GetValue<uint64_t>(2);
+		sort_field.expression = row.GetValue<string>(3);
+		sort_field.dialect = row.GetValue<string>(4);
+		sort_field.sort_direction =
+		    StringUtil::CIEquals(row.GetValue<string>(5), "DESC") ? OrderType::DESCENDING : OrderType::ASCENDING;
+		sort_field.null_order = StringUtil::CIEquals(row.GetValue<string>(6), "NULLS_FIRST")
+		                            ? OrderByNullType::NULLS_FIRST
+		                            : OrderByNullType::NULLS_LAST;
+		sorts.back().fields.push_back(std::move(sort_field));
+	}
+	return sorts;
+}
+
 idx_t DuckLakeMetadataManager::GetBeginSnapshotForTable(TableIndex table_id) {
 	string query = R"(
 SELECT begin_snapshot

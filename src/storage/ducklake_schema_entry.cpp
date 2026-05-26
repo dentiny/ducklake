@@ -23,6 +23,13 @@ DuckLakeSchemaEntry::DuckLakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &inf
       data_path(std::move(data_path_p)) {
 }
 
+DuckLakeSchemaEntry::DuckLakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, SchemaIndex schema_id,
+                                         string schema_uuid, string data_path_p, DuckLakeSnapshot lazy_snapshot_p)
+    : DuckLakeSchemaEntry(catalog, info, schema_id, std::move(schema_uuid), std::move(data_path_p)) {
+	lazy_entry = true;
+	lazy_snapshot = lazy_snapshot_p;
+}
+
 unique_ptr<CreateInfo> DuckLakeSchemaEntry::GetInfo() const {
 	auto result = SchemaCatalogEntry::GetInfo();
 	result->on_conflict = OnCreateConflict::IGNORE_ON_CONFLICT;
@@ -294,6 +301,19 @@ void DuckLakeSchemaEntry::Scan(ClientContext &context, CatalogType type,
 			callback(*entry.second);
 		}
 	}
+	if (lazy_entry) {
+		auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
+		ducklake_catalog.ScanSchemaEntries(duck_transaction, lazy_snapshot, schema_id, type, [&](CatalogEntry &entry) {
+			if (duck_transaction.IsDeleted(entry) || duck_transaction.IsRenamed(entry)) {
+				return;
+			}
+			if (local_set && local_set->GetEntry(entry.name)) {
+				return;
+			}
+			callback(entry);
+		});
+		return;
+	}
 	// scan committed entries
 	auto &catalog_set = GetCatalogSet(type);
 	for (auto &entry : catalog_set.GetEntries()) {
@@ -309,6 +329,9 @@ void DuckLakeSchemaEntry::Scan(ClientContext &context, CatalogType type,
 }
 
 void DuckLakeSchemaEntry::Scan(CatalogType type, const std::function<void(CatalogEntry &)> &callback) {
+	if (lazy_entry) {
+		throw InternalException("Cannot scan lazy DuckLake schema entry without a client context");
+	}
 	auto &catalog_set = GetCatalogSet(type);
 	for (auto &entry : catalog_set.GetEntries()) {
 		callback(*entry.second);
@@ -353,6 +376,18 @@ optional_ptr<CatalogEntry> DuckLakeSchemaEntry::LookupEntry(CatalogTransaction t
 	if (transaction_entry) {
 		return transaction_entry;
 	}
+	if (lazy_entry) {
+		auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
+		auto entry = ducklake_catalog.LookupEntryInSchema(duck_transaction, lazy_snapshot, schema_id, catalog_type,
+		                                                  entry_name);
+		if (!entry) {
+			return nullptr;
+		}
+		if (duck_transaction.IsDeleted(*entry) || duck_transaction.IsRenamed(*entry)) {
+			return nullptr;
+		}
+		return *entry;
+	}
 	auto &catalog_set = GetCatalogSet(catalog_type);
 	auto entry = catalog_set.GetEntry(entry_name);
 	if (!entry) {
@@ -385,6 +420,22 @@ SimilarCatalogEntry DuckLakeSchemaEntry::GetSimilarEntry(CatalogTransaction tran
 			}
 		}
 	}
+	if (lazy_entry) {
+		auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
+		ducklake_catalog.ScanSchemaEntries(duck_transaction, lazy_snapshot, schema_id, catalog_type,
+		                                   [&](CatalogEntry &entry) {
+			                                   if (duck_transaction.IsDeleted(entry) || duck_transaction.IsRenamed(entry)) {
+				                                   return;
+			                                   }
+			                                   auto entry_score = StringUtil::SimilarityRating(entry.name, entry_name);
+			                                   if (entry_score > result.score) {
+				                                   result.score = entry_score;
+				                                   result.name = entry.name;
+				                                   result.schema = this;
+			                                   }
+		                                   });
+		return result;
+	}
 	// check commited entries, without binding views
 	auto &catalog_set = GetCatalogSet(catalog_type);
 	for (auto &entry : catalog_set.GetEntries()) {
@@ -416,6 +467,72 @@ void DuckLakeSchemaEntry::TryDropSchema(DuckLakeTransaction &transaction, bool c
 		vector<reference<CatalogEntry>> dependents;
 		const auto &dropped_tables = transaction.GetDroppedTables();
 		const auto &dropped_views = transaction.GetDroppedViews();
+		const auto &dropped_macros = transaction.GetDroppedScalarMacros();
+		const auto &dropped_table_macros = transaction.GetDroppedTableMacros();
+		if (lazy_entry) {
+			auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
+			ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::TABLE_ENTRY,
+			                                   [&](CatalogEntry &entry) {
+				                                   bool add_dependent = false;
+				                                   if (entry.type == CatalogType::VIEW_ENTRY) {
+					                                   auto &ducklake_view = entry.Cast<DuckLakeViewEntry>();
+					                                   add_dependent =
+					                                       dropped_views.find(ducklake_view.GetViewId()) == dropped_views.end();
+				                                   } else if (entry.type == CatalogType::TABLE_ENTRY) {
+					                                   auto &ducklake_table = entry.Cast<DuckLakeTableEntry>();
+					                                   add_dependent = dropped_tables.find(ducklake_table.GetTableId()) ==
+					                                                   dropped_tables.end();
+				                                   }
+				                                   if (add_dependent) {
+					                                   dependents.push_back(entry);
+				                                   }
+			                                   });
+			ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::MACRO_ENTRY,
+			                                   [&](CatalogEntry &entry) {
+				                                   auto &ducklake_macro = entry.Cast<DuckLakeScalarMacroEntry>();
+				                                   if (dropped_macros.find(ducklake_macro.GetIndex()) == dropped_macros.end()) {
+					                                   dependents.push_back(entry);
+				                                   }
+			                                   });
+			ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::TABLE_MACRO_ENTRY,
+			                                   [&](CatalogEntry &entry) {
+				                                   auto &ducklake_macro = entry.Cast<DuckLakeTableMacroEntry>();
+				                                   if (dropped_table_macros.find(ducklake_macro.GetIndex()) ==
+				                                       dropped_table_macros.end()) {
+					                                   dependents.push_back(entry);
+				                                   }
+			                                   });
+			if (local_tables) {
+				dependents.reserve(dependents.size() + local_tables->GetEntries().size());
+				for (auto &entry : local_tables->GetEntries()) {
+					dependents.push_back(*entry.second);
+				}
+			}
+			if (local_scalar_macros) {
+				dependents.reserve(dependents.size() + local_scalar_macros->GetEntries().size());
+				for (auto &entry : local_scalar_macros->GetEntries()) {
+					dependents.push_back(*entry.second);
+				}
+			}
+			if (local_table_macros) {
+				dependents.reserve(dependents.size() + local_table_macros->GetEntries().size());
+				for (auto &entry : local_table_macros->GetEntries()) {
+					dependents.push_back(*entry.second);
+				}
+			}
+			if (dependents.empty()) {
+				return;
+			}
+			string error_string = "Cannot drop schema \"" + name + "\" because there are entries that depend on it\n";
+			for (auto &dependent : dependents) {
+				auto &dep = dependent.get();
+				error_string += StringUtil::Format("%s \"%s\" depends on %s \"%s\".\n",
+				                                   StringUtil::Lower(CatalogTypeToString(dep.type)), dep.name,
+				                                   StringUtil::Lower(CatalogTypeToString(type)), name);
+			}
+			error_string += "Use DROP...CASCADE to drop all dependents.";
+			throw CatalogException(error_string);
+		}
 		for (auto &entry : tables.GetEntries()) {
 			bool add_dependent = false;
 			switch (entry.second->type) {
@@ -531,6 +648,16 @@ void DuckLakeSchemaEntry::TryDropSchema(DuckLakeTransaction &transaction, bool c
 	}
 	for (auto &entry : local_entries_to_drop) {
 		transaction.DropEntry(entry.get());
+	}
+	if (lazy_entry) {
+		auto &ducklake_catalog = catalog.Cast<DuckLakeCatalog>();
+		ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::TABLE_ENTRY,
+		                                   [&](CatalogEntry &entry) { transaction.DropEntry(entry); });
+		ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::MACRO_ENTRY,
+		                                   [&](CatalogEntry &entry) { transaction.DropEntry(entry); });
+		ducklake_catalog.ScanSchemaEntries(transaction, lazy_snapshot, schema_id, CatalogType::TABLE_MACRO_ENTRY,
+		                                   [&](CatalogEntry &entry) { transaction.DropEntry(entry); });
+		return;
 	}
 	for (auto &entry : tables.GetEntries()) {
 		transaction.DropEntry(*entry.second);

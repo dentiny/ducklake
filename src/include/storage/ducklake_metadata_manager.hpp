@@ -163,6 +163,18 @@ protected:
 public:
 	//! Get the catalog information for a specific snapshot
 	virtual DuckLakeCatalogInfo GetCatalogForSnapshot(DuckLakeSnapshot snapshot);
+	virtual vector<DuckLakeSchemaInfo> GetSchemasForSnapshot(DuckLakeSnapshot snapshot, optional_idx schema_id = {},
+	                                                         const string &schema_name = string());
+	virtual vector<DuckLakeTableInfo> GetTablesForSnapshot(DuckLakeSnapshot snapshot, optional_idx schema_id = {},
+	                                                       optional_idx table_id = {},
+	                                                       const string &table_name = string());
+	virtual vector<DuckLakeViewInfo> GetViewsForSnapshot(DuckLakeSnapshot snapshot, optional_idx schema_id = {},
+	                                                     optional_idx view_id = {}, const string &view_name = string());
+	virtual vector<DuckLakeMacroInfo> GetMacrosForSnapshot(DuckLakeSnapshot snapshot, optional_idx schema_id = {},
+	                                                       optional_idx macro_id = {},
+	                                                       const string &macro_name = string());
+	virtual vector<DuckLakePartitionInfo> GetPartitionsForSnapshot(DuckLakeSnapshot snapshot, optional_idx table_id = {});
+	virtual vector<DuckLakeSortInfo> GetSortsForSnapshot(DuckLakeSnapshot snapshot, optional_idx table_id = {});
 	virtual vector<DuckLakeGlobalStatsInfo> GetGlobalTableStats(DuckLakeSnapshot snapshot, TableIndex table_id);
 	virtual vector<DuckLakeFileListEntry> GetFilesForTable(DuckLakeTableEntry &table, DuckLakeSnapshot snapshot,
 	                                                       const FilterPushdownInfo *filter_info = nullptr);

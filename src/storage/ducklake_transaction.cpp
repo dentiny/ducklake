@@ -2085,8 +2085,47 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 	DuckLakeNewGlobalStats new_globals;
 	unique_ptr<DuckLakeStats> dl_stats;
 	if (stats) {
-		auto &schema = ducklake_catalog.GetSchemaForSnapshot(*this, GetSnapshot());
-		dl_stats = ducklake_catalog.ConstructStatsMap(*stats, schema);
+		dl_stats = make_uniq<DuckLakeStats>();
+		auto snapshot = GetSnapshot();
+		for (auto &stats_entry : *stats) {
+			auto table_entry = ducklake_catalog.GetEntryById(*this, snapshot, stats_entry.table_id);
+			if (!table_entry) {
+				continue;
+			}
+			auto &table = table_entry->Cast<DuckLakeTableEntry>();
+			auto table_stats = make_uniq<DuckLakeTableStats>();
+			table_stats->record_count = stats_entry.record_count;
+			table_stats->next_row_id = stats_entry.next_row_id;
+			table_stats->table_size_bytes = stats_entry.table_size_bytes;
+			for (auto &col_stats : stats_entry.column_stats) {
+				auto field = table.GetFieldId(col_stats.column_id);
+				if (!field) {
+					continue;
+				}
+				DuckLakeColumnStats column_stats(field->Type());
+				column_stats.has_null_count = col_stats.has_contains_null;
+				if (column_stats.has_null_count) {
+					column_stats.null_count = col_stats.contains_null ? 1 : 0;
+				}
+				column_stats.has_contains_nan = col_stats.has_contains_nan;
+				if (column_stats.has_contains_nan) {
+					column_stats.contains_nan = col_stats.contains_nan;
+				}
+				column_stats.has_min = col_stats.has_min;
+				if (column_stats.has_min) {
+					column_stats.min = col_stats.min_val;
+				}
+				column_stats.has_max = col_stats.has_max;
+				if (column_stats.has_max) {
+					column_stats.max = col_stats.max_val;
+				}
+				if (col_stats.has_extra_stats && column_stats.extra_stats) {
+					column_stats.extra_stats->Deserialize(col_stats.extra_stats);
+				}
+				table_stats->column_stats.insert(make_pair(col_stats.column_id, std::move(column_stats)));
+			}
+			dl_stats->table_stats.insert(make_pair(stats_entry.table_id, std::move(table_stats)));
+		}
 	}
 	for (auto &entry : local_changes.Changes()) {
 		auto table_id = commit_state.GetTableId(entry.GetTableIndex());

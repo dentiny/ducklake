@@ -10,6 +10,7 @@
 
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "storage/ducklake_catalog_set.hpp"
+#include "common/ducklake_snapshot.hpp"
 
 namespace duckdb {
 class DuckLakeTransaction;
@@ -19,6 +20,8 @@ class DuckLakeSchemaEntry : public SchemaCatalogEntry {
 public:
 	DuckLakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, SchemaIndex schema_id, string schema_uuid,
 	                    string data_path);
+	DuckLakeSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, SchemaIndex schema_id, string schema_uuid,
+	                    string data_path, DuckLakeSnapshot lazy_snapshot);
 
 public:
 	SchemaIndex GetSchemaId() const {
@@ -29,6 +32,12 @@ public:
 	}
 	const string &DataPath() const {
 		return data_path;
+	}
+	bool IsLazy() const {
+		return lazy_entry;
+	}
+	DuckLakeSnapshot GetLazySnapshot() const {
+		return lazy_snapshot;
 	}
 
 public:
@@ -73,6 +82,8 @@ private:
 	SchemaIndex schema_id;
 	string schema_uuid;
 	string data_path;
+	bool lazy_entry = false;
+	DuckLakeSnapshot lazy_snapshot;
 	DuckLakeCatalogSet tables;
 	DuckLakeCatalogSet scalar_macros;
 	DuckLakeCatalogSet table_macros;

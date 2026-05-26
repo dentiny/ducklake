@@ -15,6 +15,7 @@
 #include "duckdb/main/client_context_state.hpp"
 #include "duckdb/storage/object_cache.hpp"
 #include "storage/ducklake_catalog_set.hpp"
+#include "storage/ducklake_schema_entry.hpp"
 #include "storage/ducklake_partition_data.hpp"
 #include "storage/ducklake_stats.hpp"
 
@@ -67,16 +68,50 @@ struct DuckLakeSchemaCacheEntry : public ObjectCacheEntry {
 	optional_idx GetEstimatedCacheMemory() const override;
 };
 
-//! Query-scoped pin for DuckLake schema cache entries, which guarantee memory safety before transaction finishes.
-class DuckLakeSchemaPinState : public ClientContextState {
+//! Cache entry for a single DuckLake schema shell.
+struct DuckLakeSchemaEntryCacheEntry : public ObjectCacheEntry {
+	explicit DuckLakeSchemaEntryCacheEntry(unique_ptr<DuckLakeSchemaEntry> schema_entry_p)
+	    : schema_entry(std::move(schema_entry_p)) {
+	}
+
+	unique_ptr<DuckLakeSchemaEntry> schema_entry;
+
+	static string ObjectType() {
+		return "ducklake_schema_entry";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override;
+};
+
+//! Cache entry for a single table/view/macro and its parent schema shell.
+struct DuckLakeCatalogEntryCacheEntry : public ObjectCacheEntry {
+	DuckLakeCatalogEntryCacheEntry(unique_ptr<DuckLakeSchemaEntry> schema_entry_p,
+	                               unique_ptr<CatalogEntry> catalog_entry_p);
+
+	unique_ptr<DuckLakeSchemaEntry> schema_entry;
+	unique_ptr<CatalogEntry> catalog_entry;
+
+	static string ObjectType() {
+		return "ducklake_catalog_entry";
+	}
+	string GetObjectType() override {
+		return ObjectType();
+	}
+	optional_idx GetEstimatedCacheMemory() const override;
+};
+
+//! Query-scoped pin for DuckLake cache entries, which guarantees raw pointers remain valid during a query.
+class DuckLakeCachePinState : public ClientContextState {
 public:
 	void QueryEnd(ClientContext &context) override;
-	void Pin(shared_ptr<DuckLakeSchemaCacheEntry> entry);
+	void Pin(shared_ptr<ObjectCacheEntry> entry);
 
 private:
 	mutex lock;
-	// Maps from address of the schema cache entry to the schema cache entry.
-	unordered_map<DuckLakeSchemaCacheEntry *, shared_ptr<DuckLakeSchemaCacheEntry>> pins;
+	// Maps from address of the cache entry to the cache entry.
+	unordered_map<ObjectCacheEntry *, shared_ptr<ObjectCacheEntry>> pins;
 };
 
 enum class InlinedDeletionCacheResult { EXISTS, DOES_NOT_EXIST, UNKNOWN };
@@ -167,6 +202,10 @@ public:
 	                                        SchemaIndex schema_id);
 	optional_ptr<CatalogEntry> GetEntryById(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
 	                                        TableIndex table_id);
+	optional_ptr<CatalogEntry> LookupEntryInSchema(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot,
+	                                               SchemaIndex schema_id, CatalogType type, const string &name);
+	void ScanSchemaEntries(DuckLakeTransaction &transaction, DuckLakeSnapshot snapshot, SchemaIndex schema_id,
+	                       CatalogType type, const std::function<void(CatalogEntry &)> &callback);
 	string GeneratePathFromName(const string &uuid, const string &name);
 
 	bool InMemory() override;
@@ -261,11 +300,23 @@ private:
 	//! Look up (or load) the ObjectCache entry for a given snapshot.
 	shared_ptr<DuckLakeSchemaCacheEntry> GetSchemaCacheEntry(DuckLakeTransaction &transaction,
 	                                                         DuckLakeSnapshot snapshot);
-	//! Pin a schema cache entry for the duration of the current query to ensure safe memory access.
-	void PinSchemaForQuery(DuckLakeTransaction &transaction, shared_ptr<DuckLakeSchemaCacheEntry> entry);
+	shared_ptr<DuckLakeSchemaEntryCacheEntry> GetSchemaEntryCacheEntry(DuckLakeTransaction &transaction,
+	                                                                   DuckLakeSnapshot snapshot,
+	                                                                   SchemaIndex schema_id);
+	shared_ptr<DuckLakeCatalogEntryCacheEntry> GetCatalogEntryCacheEntry(DuckLakeTransaction &transaction,
+	                                                                     DuckLakeSnapshot snapshot,
+	                                                                     TableIndex table_id);
+	shared_ptr<DuckLakeCatalogEntryCacheEntry> GetCatalogEntryCacheEntry(DuckLakeTransaction &transaction,
+	                                                                     DuckLakeSnapshot snapshot,
+	                                                                     SchemaIndex schema_id, CatalogType type,
+	                                                                     const string &name);
+	//! Pin a cache entry for the duration of the current query to ensure safe memory access.
+	void PinCacheEntryForQuery(DuckLakeTransaction &transaction, shared_ptr<ObjectCacheEntry> entry);
 	void LoadNameMaps(DuckLakeTransaction &transaction);
 	string StatsCacheKey(idx_t next_file_id, TableIndex table_id) const;
 	string SchemaCacheKey(idx_t schema_version) const;
+	string SchemaEntryCacheKey(idx_t schema_version, SchemaIndex schema_id) const;
+	string CatalogEntryCacheKey(idx_t schema_version, CatalogType type, idx_t entry_id) const;
 	string SchemaPinStateKey() const;
 	ObjectCache &GetObjectCacheInstance();
 
