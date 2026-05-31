@@ -917,7 +917,8 @@ vector<DuckLakeGlobalStatsInfo> TransformGlobalStats(QueryResult &result) {
 	return global_stats;
 }
 
-vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot, TableIndex table_id) {
+vector<DuckLakeGlobalStatsInfo> DuckLakeMetadataManager::GetGlobalTableStats(DuckLakeSnapshot snapshot,
+                                                                             TableIndex table_id) {
 	// query the most recent stats for a single table
 	string query = StringUtil::Format(R"(
 SELECT table_id, column_id, record_count, next_row_id, file_size_bytes, contains_null, contains_nan, min_value, max_value, extra_stats
@@ -927,7 +928,8 @@ WHERE table_id = %llu
   AND record_count IS NOT NULL 
   AND file_size_bytes IS NOT NULL
 ORDER BY table_id;
-)", table_id.index);
+)",
+	                                  table_id.index);
 
 	auto result = transaction.Query(snapshot, query);
 	return TransformGlobalStats(*result);
@@ -1398,7 +1400,7 @@ struct DynamicFilterColumn {
 //! string ("6", "3", ...) that matches what the writer stores. Returns empty optional on any failure
 //! (cast error, evaluation error, NULL) so the caller can skip this filter and fall back to zone maps.
 static optional_idx FoldBucketValue(ClientContext &context, const Value &constant, const LogicalType &col_type,
-                                     idx_t bucket_count, string &out_partition_value) {
+                                    idx_t bucket_count, string &out_partition_value) {
 	if (constant.IsNull()) {
 		return optional_idx();
 	}
@@ -1423,8 +1425,8 @@ static optional_idx FoldBucketValue(ClientContext &context, const Value &constan
 //! partition_value string to `out`. Returns true if at least one valid constant was collected.
 //! Unsupported shapes (range comparisons, OR-conjunctions, dynamic filters, etc.) return false
 //! and pruning is skipped for this column — the existing zone-map path handles correctness.
-static bool CollectBucketEqualityValues(ClientContext &context, const TableFilter &filter,
-                                         const LogicalType &col_type, idx_t bucket_count, vector<string> &out) {
+static bool CollectBucketEqualityValues(ClientContext &context, const TableFilter &filter, const LogicalType &col_type,
+                                        idx_t bucket_count, vector<string> &out) {
 	switch (filter.filter_type) {
 	case TableFilterType::CONSTANT_COMPARISON: {
 		auto &cf = filter.Cast<ConstantFilter>();
@@ -1450,8 +1452,8 @@ static bool CollectBucketEqualityValues(ClientContext &context, const TableFilte
 		return !out.empty();
 	}
 	case TableFilterType::OPTIONAL_FILTER:
-		return CollectBucketEqualityValues(context, *filter.Cast<OptionalFilter>().child_filter, col_type,
-		                                    bucket_count, out);
+		return CollectBucketEqualityValues(context, *filter.Cast<OptionalFilter>().child_filter, col_type, bucket_count,
+		                                   out);
 	case TableFilterType::CONJUNCTION_AND: {
 		// A child equality on this column gives a valid (tighter) prune. Over-inclusion from
 		// contradictory ANDs (a = 1 AND a = 2) is correctness-safe — the residual filter still runs.
@@ -1492,7 +1494,7 @@ string DuckLakeMetadataManager::BuildBucketPartitionPruningClause(DuckLakeTableE
 
 		vector<string> bucket_values;
 		if (!CollectBucketEqualityValues(context, *col_filter.table_filter, col_filter.column_type,
-		                                  field.transform.bucket_count, bucket_values)) {
+		                                 field.transform.bucket_count, bucket_values)) {
 			continue;
 		}
 		if (bucket_values.empty()) {
@@ -2330,7 +2332,15 @@ static void ColumnToSQLRecursive(const DuckLakeColumnInfo &column, TableIndex ta
 	if (!column.default_value.IsNull()) {
 		auto value = column.default_value.GetValue<string>();
 		if (column.default_value_type == "literal") {
-			default_val = KeywordHelper::WriteQuoted(value, '\'');
+			// Special handle "NULL" literal default value for VARCHAR columns.
+			// Normally we store constant default as literal type, but it's not enough to tell apart from (1) VARCHAR
+			// column with default value NULL; and (2) VARCHAR coluimn with default "NULL".
+			if (column.default_value.type().id() == LogicalTypeId::VARCHAR && value == "NULL") {
+				default_val = KeywordHelper::WriteQuoted(column.default_value.ToSQLString(), '\'');
+				default_val_type = "'expression'";
+			} else {
+				default_val = KeywordHelper::WriteQuoted(value, '\'');
+			}
 		} else if (column.default_value_type == "expression") {
 			if (value.empty()) {
 				default_val = "''";
