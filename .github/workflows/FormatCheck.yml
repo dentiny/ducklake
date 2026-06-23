@@ -36,6 +36,16 @@ jobs:
           sudo apt-get install -y -qq ninja-build clang-format-11
           sudo pip3 install cmake-format 'black==24.*' cxxheaderparser pcpp 'clang_format==11.0.1'
           sudo update-alternatives --install /usr/bin/clang-format clang-format /usr/bin/clang-format-11 100
+          sudo update-alternatives --set clang-format /usr/bin/clang-format-11
+          python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          python_bin_dir = os.path.dirname(os.path.abspath(sys.executable))
+          os.environ['PATH'] = python_bin_dir + os.pathsep + os.environ.get('PATH', '')
+          print(subprocess.check_output(('clang-format', '--version'), text=True), end='')
+          PY
 
       - name: List Installed Packages
         run: pip3 freeze
