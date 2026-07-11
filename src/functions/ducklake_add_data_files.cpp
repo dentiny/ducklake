@@ -151,6 +151,7 @@ private:
 	                                                    const vector<unique_ptr<DuckLakeFieldId>> &field_ids,
 	                                                    const string &prefix = string());
 	void MapColumnStats(ParquetFileMetadata &file_metadata, DuckLakeDataFile &result);
+	void VerifyConstraints(DuckLakeDataFile &file);
 	unique_ptr<DuckLakeNameMapEntry> MapHiveColumn(ParquetFileMetadata &file_metadata, const DuckLakeFieldId &field_id,
 	                                               const Value &hive_value);
 	void DetermineMapping(ParquetFileMetadata &file);
@@ -1109,6 +1110,30 @@ void DuckLakeFileProcessor::MapColumnStats(ParquetFileMetadata &file_metadata, D
 	}
 }
 
+void DuckLakeFileProcessor::VerifyConstraints(DuckLakeDataFile &file) {
+	auto not_null_fields = table.GetNotNullFields();
+	if (not_null_fields.empty()) {
+		return;
+	}
+
+	for (auto &column : table.GetColumns().Logical()) {
+		auto column_name = column.Name().GetIdentifierName();
+		if (!not_null_fields.count(column_name)) {
+			continue;
+		}
+		auto &field_id = table.GetFieldData().GetByRootIndex(column.Physical());
+		auto stats_entry = file.column_stats.find(field_id.GetFieldIndex());
+		if (stats_entry == file.column_stats.end()) {
+			continue;
+		}
+		auto &stats = stats_entry->second;
+		if (stats.has_null_count && stats.null_count > 0) {
+			throw ConstraintException("NOT NULL constraint failed: %s.%s", table.name, column_name);
+		}
+		// TODO(hjiang): add validation where null count is not available.
+	}
+}
+
 vector<unique_ptr<DuckLakeNameMapEntry>>
 DuckLakeFileProcessor::MapColumns(ParquetFileMetadata &file_metadata,
                                   vector<unique_ptr<ParquetColumn>> &parquet_columns,
@@ -1227,6 +1252,7 @@ DuckLakeDataFile DuckLakeFileProcessor::AddFileToTable(ParquetFileMetadata &file
 	auto name_map = make_uniq<DuckLakeNameMap>();
 	name_map->table_id = table.GetTableId();
 	MapColumnStats(file, result);
+	VerifyConstraints(result);
 	name_map->column_maps = std::move(file.map_entries);
 
 	// we successfully mapped this file - register the name map and refer to it in the file

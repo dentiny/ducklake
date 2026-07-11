@@ -1,0 +1,35 @@
+# name: test/sql/add_files/add_files_not_null_constraints.test
+# description: ducklake_add_data_files should reject files that violate NOT NULL constraints
+# group: [add_files]
+
+require ducklake
+
+require parquet
+
+test-env DUCKLAKE_CONNECTION {TEST_DIR}/{UUID}.db
+
+test-env DATA_PATH {TEST_DIR}
+
+statement ok
+ATTACH 'ducklake:{DUCKLAKE_CONNECTION}' AS ducklake (
+  DATA_PATH '{DATA_PATH}/ducklake_add_files_not_null_constraints',
+  DATA_INLINING_ROW_LIMIT 0
+)
+
+statement ok
+COPY (
+  SELECT * FROM (VALUES (1, 10), (2, NULL)) v(id, x)
+) TO '{DATA_PATH}/add_files_not_null_scalar.parquet' (FORMAT parquet)
+
+statement ok
+CREATE TABLE ducklake.scalar_not_null(id INTEGER, x INTEGER NOT NULL)
+
+statement error
+CALL ducklake_add_data_files('ducklake', 'scalar_not_null', '{DATA_PATH}/add_files_not_null_scalar.parquet')
+----
+NOT NULL constraint
+
+query I
+SELECT COUNT(*) FROM ducklake.scalar_not_null
+----
+0
